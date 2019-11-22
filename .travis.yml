@@ -1,0 +1,6 @@
+language: go
+go:
+- 1.11.x
+script:
+  - go test -v -covermode=count -coverprofile=coverage.out
+  - go run github.com/mattn/goveralls -coverprofile=coverage.out -service=travis-ci -repotoken $COVERALLS_TOKEN
