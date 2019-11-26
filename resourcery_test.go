@@ -2,13 +2,14 @@ package resourcery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 )
 
 func TestMultiPutGet(t *testing.T) {
-	p := NewManagedPool(func(action Action) {
+	p := NewMonitoredPool(func(msg ActionMsg) {
 		//Here, we could do something to decide if the pool needs to grow / shrink.
 		// log.Printf("Pool updated with action %d", action)
 	})
@@ -67,6 +68,9 @@ func TestAddUnhealthy(t *testing.T) {
 
 func TestResourceGoneBadInQueue(t *testing.T) {
 	p := NewPool()
+	p.MonitorFunc = func(msg ActionMsg) {
+		//Do nothing
+	}
 	//Add 2 resources
 	bad := &testResource{index: 77, healthy: true}
 	_ = p.AddResource(bad)
@@ -100,6 +104,9 @@ func TestResourceGoneBadInQueue(t *testing.T) {
 
 func TestShutdown(t *testing.T) {
 	p := NewPool()
+	p.MonitorFunc = func(msg ActionMsg) {
+		//Do nothing
+	}
 	shutdownCount := 0
 	_ = p.AddResource(&testResource{index: 0, healthy: true, shutdownCount: &shutdownCount})
 	_ = p.AddResource(&testResource{index: 0, healthy: true, shutdownCount: &shutdownCount})
@@ -123,6 +130,153 @@ func TestTimeout(t *testing.T) {
 	if ctx.Err().Error() != "context deadline exceeded" {
 		t.Errorf("Unexpected error: %s", ctx.Err())
 		return
+	}
+}
+
+func TestWizard(t *testing.T) {
+	cnt := 0
+	//keep a pointer to index 3 for setting unhealthy
+	var res3 *testResource
+	w, err := NewWizard(
+		func() (Resource, error) {
+			cnt++
+			res := &testResource{
+				index:   cnt,
+				healthy: true,
+			}
+			if cnt == 3 {
+				res3 = res
+			}
+			return res, nil
+		},
+		10,
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	//Now set res.healthy to false
+	res3.healthy = false
+	//Now get resources & make sure we get an 11th resource as a replacement for
+	//index 3 which was made unhealthy.
+	res11 := false
+	for i := 0; i < 15; i++ {
+		res, err := w.Pool().GetResource(context.Background())
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if !res.IsHealthy() {
+			t.Error("Got unhealthy resource")
+		}
+		tstRes, ok := res.(*testResource)
+		if !ok {
+			t.Error("Failed to convert to testResource")
+		}
+		if tstRes.index == 11 {
+			res11 = true
+		}
+		err = w.Pool().AddResource(tstRes)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}
+	if !res11 {
+		t.Error("Failed to get an 11th resource to replace unhealthy resource 3")
+	}
+}
+
+func TestWizardUnhealthyFactory(t *testing.T) {
+	_, err := NewWizard(
+		func() (Resource, error) {
+			res := &testResource{
+				index:   0,
+				healthy: false,
+			}
+			return res, nil
+		},
+		1,
+	)
+	if err == nil {
+		t.Error("Should have failed to add unhealthy resources")
+		return
+	}
+}
+
+func TestWizardErrorFactory(t *testing.T) {
+	_, err := NewWizard(
+		func() (Resource, error) {
+			return nil, errors.New("Bad resource from bad factory")
+		},
+		1,
+	)
+	if err == nil {
+		t.Error("Should have failed with an error creating a resource")
+		return
+	}
+}
+
+func TestWizardUnhealthyReplacementFactory(t *testing.T) {
+	var res *testResource
+	w, err := NewWizard(
+		func() (Resource, error) {
+			res = &testResource{
+				index:   0,
+				healthy: true,
+			}
+			return res, nil
+		},
+		1,
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	//Make the resource unhealthy so the wizard tries to replace it.
+	res.healthy = false
+	//Replace the ResourceFactory with one that returns unhealthy resources
+	w.resourceFactory = func() (Resource, error) {
+		return &testResource{
+			index:   0,
+			healthy: false,
+		}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*10)
+	defer cancel()
+	_, err = w.Pool().GetResource(ctx)
+	if err == nil {
+		t.Error("We expected to get a timeout because GetResource won't get a resource back")
+		return
+	}
+}
+
+func TestWizardReplacementErrorFactory(t *testing.T) {
+	var res *testResource
+	w, err := NewWizard(
+		func() (Resource, error) {
+			res = &testResource{healthy: true}
+			return res, nil
+		},
+		1,
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	res.healthy = false
+	w.resourceFactory = func() (Resource, error) {
+		return nil, errors.New("This is supposed to fail")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+	defer cancel()
+	_, err = w.Pool().GetResource(ctx)
+	if err == nil {
+		t.Error("This should have failed with a timeout as there should be no available resources")
+		return
+	}
+	if w.Pool().Size() != 0 {
+		t.Errorf("Pool size should be 0 but is %d", w.Pool().Size())
 	}
 }
 
